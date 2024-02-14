@@ -6,6 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+bytemuck = "1.14.3"
 ctru-rs = { git = "https://github.com/rust3ds/ctru-rs", version = "0.7.1" }
-ctru-sys = { git = "https://github.com/rust3ds/ctru-rs", version = "22.2.0" }
+ctru-sys = { git = "https://github.com/rust3ds/ctru-rs", version = "0.5.0" }
 deflate = "1.0.0"

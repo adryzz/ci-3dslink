@@ -20,8 +20,6 @@ const GDB_ENABLED_STR: &str = "\x1b[32;1menabled\x1b[0m";
 const GDB_DISABLED_STR: &str = "\x1b[31;1mdisabled\x1b[0m";
 
 fn main() {
-    ctru::use_panic_handler();
-
     let gfx = Gfx::new().expect("Couldn't obtain GFX controller");
     let mut hid = Hid::new().expect("Couldn't obtain HID controller");
     let apt = Apt::new().expect("Couldn't obtain APT controller");
@@ -56,7 +54,7 @@ fn main() {
         }
 
         if keys.contains(KeyPad::Y) {
-            if exec_3dsx("sdmc:/3ds/ci-3dslink.3dsx", vec!["abc, def, ghi"]).is_ok() {
+            if exec_3dsx("sdmc:/3ds/ci-3dslink.3dsx", &[]).is_ok() {
                 return;
             } else {
                 println!("\x1b[31;1mCouldn't run 3dsx!\x1b[0m")
@@ -93,7 +91,7 @@ fn netloader_activate(endpoint: &str) -> io::Result<()> {
 }
 
 
-fn exec_3dsx(path: &str, args: Vec<&str>) -> Result<(), ()> {
+fn exec_3dsx(path: &str, args: &[&str]) -> Result<(), ()> {
 
     // handle args
 
@@ -143,6 +141,27 @@ fn exec_3dsx(path: &str, args: Vec<&str>) -> Result<(), ()> {
 
     println!("{}", std::mem::size_of_val(&buf[..]));
     launch_3dsx(path, &buf[..])
+}
+
+fn build_argv(path: &str, args: &[&str]) -> ([u8; 0x400], usize) {
+    let mut buf = [0u8; 0x400];
+
+    let mut i = 0;
+
+    let num_args = (args.len() + 1) as u32;
+    buf[..4].copy_from_slice(&num_args.to_le_bytes());
+    i += 4;
+
+    let iter = std::iter::once(&path).chain(args);
+
+    for arg in iter {
+        buf[i..][..arg.len()].copy_from_slice(arg.as_bytes());
+        i += arg.len();
+        //buf[i] = 0; // redundant
+        i += 1;
+    }
+
+    (buf, i)
 }
 
 fn launch_3dsx(path: &str, argv: &[u32]) -> Result<(), ()> {
