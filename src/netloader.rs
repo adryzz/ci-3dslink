@@ -1,7 +1,7 @@
 use std::{
     fs::File, io::{self, Read, Write}, net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket}
 };
-//use flate2::read::ZlibDecoder;
+use flate2::read::ZlibDecoder;
 pub const PORT: u16 = 17491;
 pub const MAX_FILENAME: usize = 256;
 
@@ -37,7 +37,7 @@ pub enum NetloaderStatus {
     /// Receiving the file, ZLIB compressed. If there are any errors it goes back to [NetloaderStatus::Listening] status.
     /// 
     /// At the end of the ZLIB stream, it replies with an Ok (0) or Err (-1) [u32], and enters [NetloaderStatus::Arguments] status.
-    File(TcpStream, File),
+    File(ZlibDecoder<TcpStream>, File),
     /// Receiving the program arguments.
     /// 
     /// Length ([u32]), and arguments TODO
@@ -172,13 +172,39 @@ impl Netloader {
                 // send back an OK
                 stream.write(&[0, 0, 0, 0])?;
 
-                // TODO: VERY MUCH FIXME, THIS IS BAD (BUT WORKS FOR NOW)
-                self.status = NetloaderStatus::File(unsafe {std::ptr::read(stream as *mut TcpStream)}, file);
+                // FIXME???
+                take_mut::take(&mut self.status, |outstatus| {
+                    if let NetloaderStatus::FileInfo(outstream) = outstatus {
+                        NetloaderStatus::File(ZlibDecoder::new(outstream), file)
+                    } else {
+                        outstatus
+                    }
+                });
 
                 Ok(())
             },
-            NetloaderStatus::File(s, f) => return Err(io::Error::new(io::ErrorKind::Unsupported, "Not Implemented Yet")),
-            NetloaderStatus::Arguments(s) => return Err(io::Error::new(io::ErrorKind::Unsupported, "Not Implemented Yet")),
+            NetloaderStatus::File(s, f) => {
+                //recv_buf.fill(0);
+                let bytes_read = s.read(recv_buf)?;
+
+                if bytes_read == 0 {
+                    take_mut::take(&mut self.status, |outstatus| {
+                        if let NetloaderStatus::File(outstream, _file) = outstatus {
+                            NetloaderStatus::Arguments(outstream.into_inner())
+                        } else {
+                            outstatus
+                        }
+                    });
+                    return Ok(())
+                }
+                f.write_all(&recv_buf[..bytes_read])?;
+                Ok(())
+            },
+            NetloaderStatus::Arguments(s) => {
+                // send back an OK
+                s.write(&[0, 0, 0, 0])?;
+                Ok(())
+            }
         }
     }
 }
