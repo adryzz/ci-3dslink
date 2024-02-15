@@ -1,110 +1,153 @@
 use std::{
     fs::File, io::{self, Read, Write}, net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket}
 };
-use flate2::read::ZlibDecoder;
+//use flate2::read::ZlibDecoder;
 pub const PORT: u16 = 17491;
+pub const MAX_FILENAME: usize = 256;
 
 #[derive(Debug)]
 pub struct Netloader {
     broadcastsock: UdpSocket,
     listensock: TcpListener,
-    wait_count: u32,
-    stream: Option<TcpStream>,
-    file: Option<FileInfo>,
+    status: NetloaderStatus,
 }
 
 #[derive(Debug)]
-pub struct FileInfo {
-    bytes_received: usize,
-    file: File
+/// The status this Netloader is in
+pub enum NetloaderStatus {
+    /// Listening for UDP broadcast messages on port 17491.
+    /// 
+    /// When receiving the "3dsboot" message, it sends "boot3ds" on port 17491 to that device,
+    ///  and enters [NetloaderStatus::WaitingForTCP] status.
+    Listening,
+    /// Waiting for a TCP connection on port 17491.
+    /// 
+    /// When a connection from the ip address arrives, it enters [NetloaderStatus::FileInfo] status.
+    /// 
+    /// After waiting for 10 frames without a connection, it goes back to [NetloaderStatus::Listening] status.
+    WaitingForTCP(IpAddr, u32),
+    /// Waiting for information about the file to be received.
+    /// 
+    /// File name length ([u32]), File name, File size ([u32])
+    /// 
+    /// After receiving those, it replies with an Ok (0) or Err (-1) [u32].
+    /// 
+    /// If there aren't any errors, it enters [NetloaderStatus::File] status, otherwise it goes back to [NetloaderStatus::Listening] status.
+    FileInfo(TcpStream),
+    /// Receiving the file, ZLIB compressed. If there are any errors it goes back to [NetloaderStatus::Listening] status.
+    /// 
+    /// At the end of the ZLIB stream, it replies with an Ok (0) or Err (-1) [u32], and enters [NetloaderStatus::Arguments] status.
+    File(TcpStream, File),
+    /// Receiving the program arguments.
+    /// 
+    /// Length ([u32]), and arguments TODO
+    Arguments(TcpStream),
 }
 
 impl Netloader {
-    pub fn new(addr: IpAddr) -> io::Result<Self> {
-        let broadcast = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), PORT);
-        let broadcastsock = UdpSocket::bind(broadcast)?;
+    pub fn new() -> io::Result<Self> {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), PORT);
+
+        let broadcastsock = UdpSocket::bind(addr)?;
         broadcastsock.set_nonblocking(true)?;
 
-        let ip = SocketAddr::new(addr, PORT);
-        let listensock = TcpListener::bind(ip)?;
+        let listensock = TcpListener::bind(addr)?;
         listensock.set_nonblocking(true)?;
 
         Ok(Self {
             broadcastsock,
             listensock,
-            stream: None,
-            file: None,
-            wait_count: 0
+            status: NetloaderStatus::Listening
         })
     }
 
-    pub fn netloader_task(&mut self, recv_buf: &mut [u8]) -> io::Result<Option<String>> {
-        if self.stream.is_some() {
-            let file = self.recv_task(recv_buf)?;
-            return Ok(file);
-        } else {
-            self.listen_task(recv_buf)?;
-            return Ok(None);
-        }
-    }
-
-    fn listen_task(&mut self, recv_buf: &mut [u8]) -> io::Result<()> {
-        if self.wait_count == 0 {
-            let (read, src) = match self.broadcastsock.recv_from(recv_buf) {
-                Ok(r) => r,
-                Err(e) => {
-                    if e.kind() == io::ErrorKind::WouldBlock {
-                        return Ok(());
-                    } else {
-                        return Err(e);
-                    }
+    pub fn netloader_task(&mut self, recv_buf: &mut [u8]) -> io::Result<()> {
+        match self.netloader_task_err(recv_buf) {
+            Ok(r) => return Ok(r),
+            Err(e) => {
+                // only error out if in listening mode, otherwise get back to listening
+                match self.status {
+                    NetloaderStatus::Listening => return Err(e),
+                    NetloaderStatus::WaitingForTCP(_, _) => {
+                        eprintln!("Error while accepting connection, going back to listening");
+                    },
+                    NetloaderStatus::FileInfo(_) => {
+                        // TODO: send -1
+                        eprintln!("Error while reading file info, going back to listening");
+                    },
+                    NetloaderStatus::File(_, _) => {
+                        // TODO: send -1
+                        eprintln!("Error while reading file, going back to listening");
+                    },
+                    NetloaderStatus::Arguments(_) => {
+                        eprintln!("Error while reading arguments, going back to listening");
+                    },
                 }
-            };
-    
-            if &recv_buf[..7] == b"3dsboot" {
-                println!("received \"3dsboot\" message");
-                // send to a different port
-                self.broadcastsock.send_to(b"boot3ds", SocketAddr::new(src.ip(), PORT))?;
-                println!("sending \"boot3ds\" message");
-                self.wait_count += 1;
-            }
-        } else {
-            println!("waiting for connection");
-            self.wait_count += 1;
-            match self.listensock.accept() {
-                Ok((stream, addr)) => {
-                    self.stream = Some(stream);
-                    println!("stream good");
-                }
-                Err(e) => {
-                    if e.kind() == io::ErrorKind::WouldBlock {
-                        return Ok(());
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
+                eprintln!("{}", e);
+            },
         }
-        if self.wait_count == 10 {
-            self.wait_count = 0;
-        }
+        self.status = NetloaderStatus::Listening;
         Ok(())
     }
 
-    fn recv_task(&mut self, recv_buf: &mut [u8]) -> io::Result<Option<String>> {
-        if let Some(stream) = &mut self.stream {
+    fn netloader_task_err(&mut self, recv_buf: &mut [u8]) -> io::Result<()> {
+        match &mut self.status {
+            NetloaderStatus::Listening => {
+                let (_read, src) = match self.broadcastsock.recv_from(recv_buf) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if e.kind() == io::ErrorKind::WouldBlock {
+                            return Ok(());
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                };
 
-            if let Some(file) = &mut self.file {
-            } else {
+                if &recv_buf[..7] == b"3dsboot" {
+                    self.broadcastsock.send_to(b"boot3ds", SocketAddr::new(src.ip(), PORT))?;
+                    println!("Entering WaitingForTCP status.");
+                    self.status = NetloaderStatus::WaitingForTCP(src.ip(), 0);
+                }
+
+                Ok(())
+            },
+            NetloaderStatus::WaitingForTCP(ip, wait_count) => {
+                if *wait_count == 10 {
+                    println!("No connection, going back to Listening status.");
+                    self.status = NetloaderStatus::Listening;
+                    return Ok(());
+                }
+
+                match self.listensock.accept() {
+                    Ok((stream, addr)) => {
+                        if addr.ip() == *ip {
+                            println!("Entering FileInfo status.");
+                            self.status = NetloaderStatus::FileInfo(stream);
+                            return Ok(());
+                        } else {
+                            println!("Connection from wrong address, closing and waiting.");
+                            // connection is dropped by rust
+                            return Ok(());
+                        }
+                    }
+                    Err(e) => {
+                        if e.kind() == io::ErrorKind::WouldBlock {
+                            return Ok(());
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
+            },
+            NetloaderStatus::FileInfo(stream) => {
                 // receive the length of the filename
                 let mut namelen_buf = [0u8; 4];
                 stream.read_exact(&mut namelen_buf)?;
                 let namelen = u32::from_le_bytes(namelen_buf) as usize;
-                if namelen > recv_buf.len() {
-                    stream.shutdown(std::net::Shutdown::Both)?;
-                    println!("name long bad");
-                    self.stream = None;
-                    return Ok(None);
+                if namelen > MAX_FILENAME {
+                    println!("File name way too long! ({})", namelen);
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid input"));
                 }
 
                 // receive the filename and create/open the file
@@ -126,15 +169,16 @@ impl Netloader {
                 file.set_len(filelen as u64)?;
                 println!("file length: {}", filelen);
 
-                self.file = Some(FileInfo {
-                    file,
-                    bytes_received: 0
-                });
-
+                // send back an OK
                 stream.write(&[0, 0, 0, 0])?;
-            }
 
+                // TODO: VERY MUCH FIXME, THIS IS BAD (BUT WORKS FOR NOW)
+                self.status = NetloaderStatus::File(unsafe {std::ptr::read(stream as *mut TcpStream)}, file);
+
+                Ok(())
+            },
+            NetloaderStatus::File(s, f) => return Err(io::Error::new(io::ErrorKind::Unsupported, "Not Implemented Yet")),
+            NetloaderStatus::Arguments(s) => return Err(io::Error::new(io::ErrorKind::Unsupported, "Not Implemented Yet")),
         }
-        Ok(None)
     }
 }

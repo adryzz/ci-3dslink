@@ -4,10 +4,7 @@ mod netloader;
 use std::{
     env,
     ffi::CString,
-    io::{self, Write},
     mem::MaybeUninit,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    rc::Rc,
     slice,
     time::Duration,
 };
@@ -35,9 +32,9 @@ fn main() {
         return;
     }
 
-    let mut netloader = Netloader::new(IpAddr::V4(soc.host_address())).unwrap();
+    let mut netloader = Netloader::new().unwrap();
 
-    let mut recv_buf = [0u8; 256];
+    let mut recv_buf = [0u8; 64*1024];
 
     while apt.main_loop() {
         hid.scan_input();
